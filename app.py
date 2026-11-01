@@ -177,7 +177,7 @@ with st.sidebar:
                 st.warning('⚠️ `GPU_BACKEND_URL` missing. Set in Streamlit Secrets after starting Kaggle.')
         except requests.RequestException:
             st.error('Backend API offline. Check server logs.')
-
+"""
     with st.expander('🔑 Streamlit Cloud Secrets Guide'):
         st.markdown('''
 To configure secrets on **Streamlit Community Cloud**, go to your app settings → **Secrets** and paste:
@@ -192,7 +192,7 @@ GPU_BACKEND_TOKEN = "your-kaggle-secret-token"
 LOCAL_AGENT_API_URL = "http://127.0.0.1:8000"
 ```
 ''')
-
+"""
     if st.session_state.chat_id:
         with st.expander('Conversation settings'):
             new_title=st.text_input('Rename chat',value=(st.session_state.chat_data or {}).get('conversation',{}).get('title',''))
