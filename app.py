@@ -1,14 +1,106 @@
-import os, requests, streamlit as st
+import os, time, threading, urllib.parse, requests, streamlit as st
 from dotenv import load_dotenv
 from pathlib import Path
 from PIL import Image, ImageDraw
 from io import BytesIO
 
+# 1. Load local .env if present (local development)
 load_dotenv(dotenv_path=Path(__file__).resolve().parent/'.env', override=False)
 
-# Streamlit always talks to the local FastAPI orchestrator. The GPU token stays server-side.
+# 2. Bridge Streamlit Cloud secrets (st.secrets) to os.environ so FastAPI & agent modules have access
+def sync_secrets_to_env():
+    try:
+        if hasattr(st, "secrets"):
+            def _extract(obj):
+                items = {}
+                try:
+                    for k, v in obj.items():
+                        if isinstance(v, dict) or hasattr(v, "items"):
+                            items.update(_extract(v))
+                        elif isinstance(v, (str, int, float, bool)):
+                            items[k] = str(v)
+                except Exception:
+                    pass
+                return items
+
+            for k, v in _extract(st.secrets).items():
+                os.environ.setdefault(k, v)
+                os.environ.setdefault(k.upper(), v)
+    except Exception:
+        pass
+
+    # Normalize aliases for LOCAL_AGENT_API_URL
+    aliases = [
+        "LOCAL_AGENT_API", "local_agent_api", "local_AGENT_API",
+        "AGENT_API", "agent_api", "LOCAL_API_URL", "local_api_url", "LOCAL_AGENT_API_URL"
+    ]
+    for a in aliases:
+        if a in os.environ:
+            val = os.environ[a].strip()
+            if val and val.lower() not in ("none", "null"):
+                os.environ["LOCAL_AGENT_API_URL"] = val
+                break
+
+    if not os.getenv("LOCAL_AGENT_API_URL", "").strip():
+        os.environ["LOCAL_AGENT_API_URL"] = "http://127.0.0.1:8000"
+
+    # Normalize Groq and GPU environment aliases
+    for groq_alias in ["groq_api_key", "GROQ_KEY", "groq_key"]:
+        if groq_alias in os.environ and "GROQ_API_KEY" not in os.environ:
+            os.environ["GROQ_API_KEY"] = os.environ[groq_alias]
+    for gpu_url_alias in ["gpu_backend_url", "GPU_URL", "gpu_url"]:
+        if gpu_url_alias in os.environ and "GPU_BACKEND_URL" not in os.environ:
+            os.environ["GPU_BACKEND_URL"] = os.environ[gpu_url_alias]
+    for gpu_token_alias in ["gpu_backend_token", "GPU_TOKEN", "gpu_token"]:
+        if gpu_token_alias in os.environ and "GPU_BACKEND_TOKEN" not in os.environ:
+            os.environ["GPU_BACKEND_TOKEN"] = os.environ[gpu_token_alias]
+
+sync_secrets_to_env()
+
 API = os.getenv("LOCAL_AGENT_API_URL", "http://127.0.0.1:8000").rstrip("/")
 TIMEOUT = max(60, min(int(os.getenv("API_REQUEST_TIMEOUT", "1200")), 1800))
+
+@st.cache_resource
+def start_embedded_api_server(target_url: str):
+    """If target_url is localhost/loopback and not responding, run FastAPI in a background daemon thread."""
+    parsed = urllib.parse.urlparse(target_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8000
+    is_local = host in ("127.0.0.1", "localhost", "0.0.0.0")
+
+    if not is_local:
+        return True, "external"
+
+    # Check if a server is already running and healthy
+    try:
+        r = requests.get(f"http://127.0.0.1:{port}/health", timeout=1.5)
+        if r.status_code == 200:
+            return True, "already_running"
+    except Exception:
+        pass
+
+    # Start FastAPI with uvicorn in a daemon thread
+    def _run_server():
+        import uvicorn
+        from api.server import app as fastapi_app
+        uvicorn.run(fastapi_app, host="127.0.0.1", port=port, log_level="warning")
+
+    server_thread = threading.Thread(target=_run_server, daemon=True, name="fastapi_backend")
+    server_thread.start()
+
+    # Wait up to 10 seconds for the server to become healthy
+    start_time = time.time()
+    while time.time() - start_time < 10:
+        try:
+            r = requests.get(f"http://127.0.0.1:{port}/health", timeout=1)
+            if r.status_code == 200:
+                return True, "started"
+        except Exception:
+            time.sleep(0.4)
+
+    return False, "failed_to_start"
+
+backend_ready, backend_mode = start_embedded_api_server(API)
 
 st.set_page_config(page_title='Image Agent',page_icon='🖼️',layout='wide',initial_sidebar_state='expanded')
 st.markdown('''<style>
@@ -16,7 +108,6 @@ st.markdown('''<style>
 </style>''',unsafe_allow_html=True)
 
 def get_auth_headers():
-    # Local API is bound to loopback by default. Kaggle credentials are never sent to Streamlit.
     return {}
 
 def api_get(path, **kwargs):
@@ -37,10 +128,14 @@ def refresh_chats():
     except requests.RequestException as e: 
         st.session_state.api_error = str(e)
         st.session_state.chats = []
-        
 
 def open_chat(cid):
-    data=api_get(f'/v1/conversations/{cid}').json(); st.session_state.chat_id=cid; st.session_state.chat_data=data
+    try:
+        data = api_get(f'/v1/conversations/{cid}').json()
+        st.session_state.chat_id = cid
+        st.session_state.chat_data = data
+    except requests.RequestException as e:
+        st.session_state.api_error = str(e)
 
 if 'chats' not in st.session_state: refresh_chats()
 if 'chat_id' not in st.session_state: st.session_state.chat_id=None
@@ -59,15 +154,45 @@ with st.sidebar:
         label=('● ' if chat['id']==st.session_state.chat_id else '')+(chat.get('title') or 'New chat')
         if st.button(label[:48],key='chat_'+chat['id'],width='stretch'): open_chat(chat['id']); st.rerun()
     st.divider()
-    try:
-        health=api_get('/health',timeout=3).json()
-        st.success('Local API connected')
-        if health.get('gpu_backend_configured'):
-            st.caption('Kaggle GPU backend URL is configured')
-        else:
-            st.warning('Set GPU_BACKEND_URL in .env after starting the Kaggle deployment.')
-    except requests.RequestException:
-        st.error('Local API offline. Start api.server first.')
+    
+    # Backend & Configuration diagnostics
+    if not backend_ready:
+        st.error(f'⚠️ Backend API offline at {API}.')
+    else:
+        try:
+            health = api_get('/health', timeout=3).json()
+            if backend_mode in ('started', 'already_running'):
+                st.success('🟢 Local API connected (embedded)')
+            else:
+                st.success('🟢 API connected (external)')
+            
+            if health.get('groq_configured'):
+                st.caption(f"🤖 Groq model: `{health.get('groq_model')}`")
+            else:
+                st.warning('⚠️ `GROQ_API_KEY` missing. Add it in Streamlit Secrets.')
+
+            if health.get('gpu_backend_configured'):
+                st.caption('⚡ Kaggle GPU backend connected')
+            else:
+                st.warning('⚠️ `GPU_BACKEND_URL` missing. Set in Streamlit Secrets after starting Kaggle.')
+        except requests.RequestException:
+            st.error('Backend API offline. Check server logs.')
+
+    with st.expander('🔑 Streamlit Cloud Secrets Guide'):
+        st.markdown('''
+To configure secrets on **Streamlit Community Cloud**, go to your app settings → **Secrets** and paste:
+```toml
+GROQ_API_KEY = "gsk_..."
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GPU_BACKEND_URL = "https://your-kaggle-ngrok-url.ngrok-free.dev"
+GPU_BACKEND_TOKEN = "your-kaggle-secret-token"
+
+# Optional: defaults to http://127.0.0.1:8000
+# The FastAPI server runs automatically inside Streamlit!
+LOCAL_AGENT_API_URL = "http://127.0.0.1:8000"
+```
+''')
+
     if st.session_state.chat_id:
         with st.expander('Conversation settings'):
             new_title=st.text_input('Rename chat',value=(st.session_state.chat_data or {}).get('conversation',{}).get('title',''))
@@ -80,7 +205,7 @@ with st.sidebar:
 
 if st.session_state.chat_id is None and st.session_state.chats:
     try: open_chat(st.session_state.chats[0]['id'])
-    except requests.RequestException: pass
+    except Exception: pass
 if st.session_state.chat_id is None:
     st.title('Your image editor, in a conversation')
     st.write('Upload an image, describe the change, and keep refining it through a saved conversation.')
@@ -90,11 +215,16 @@ if st.session_state.chat_id is None:
     st.stop()
 
 try:
-    # Always reload persisted history so a rerun reflects newly saved messages and versions.
-    open_chat(st.session_state.chat_id)
+    if st.session_state.chat_id:
+        open_chat(st.session_state.chat_id)
 except requests.RequestException as e:
     st.error(f'Could not load this conversation: {e}'); st.stop()
-data=st.session_state.chat_data; conv=data['conversation']; versions=data['versions']; current_url=data.get('current_image_url')
+
+data=st.session_state.chat_data
+if not data or 'conversation' not in data:
+    st.info('Please select or start a chat from the sidebar.')
+    st.stop()
+conv=data['conversation']; versions=data['versions']; current_url=data.get('current_image_url')
 head_left,head_right=st.columns([5,1])
 with head_left: st.subheader(conv.get('title') or 'New chat')
 with head_right:
