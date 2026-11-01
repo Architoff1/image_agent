@@ -1,0 +1,15 @@
+# Local application (Ubuntu / Python 3.11+)
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+streamlit>=1.40,<2
+requests>=2.32,<3
+python-multipart>=0.0.9
+langgraph>=0.2.60
+pydantic>=2.8,<3
+Pillow>=10.0
+opencv-python-headless>=4.10,<5
+python-dotenv>=1.0,<2
+groq>=0.20,<2
+
+# Real public-web search parsing
+beautifulsoup4>=4.12,<5
